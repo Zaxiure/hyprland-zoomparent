@@ -1,0 +1,13 @@
+[repository]
+name = "hyprland-zoomparent"
+authors = ["zaxiure"]
+# commit_pins = [["<hyprland commit>", "<commit of this repo>"]]
+# Add pins once Hyprland's API changes break older versions.
+
+[zoomparent]
+description = "yabai-style zoom-parent for the dwindle layout"
+authors = ["zaxiure"]
+output = "zoomparent/zoomparent.so"
+build = [
+    "make -C zoomparent all",
+]
