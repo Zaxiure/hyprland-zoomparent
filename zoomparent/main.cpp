@@ -14,6 +14,7 @@
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 
 #include <algorithm>
 #include <ranges>
@@ -27,7 +28,6 @@ namespace {
     CFunctionHook*            g_recalcHook        = nullptr;
     CFunctionHook*            g_layoutMsgHook     = nullptr;
     CFunctionHook*            g_windowAtHook      = nullptr;
-    CFunctionHook*            g_shouldRenderHook  = nullptr;
     std::vector<PHLWINDOWREF> g_zoomed;
 
     using recalcFn    = void (*)(SDwindleNodeData*, bool, bool, bool);
@@ -58,25 +58,26 @@ namespace {
         return found;
     }
 
-    using shouldRenderFn = bool (*)(void*, PHLWINDOW, PHLMONITOR, PHLWORKSPACE, uint8_t);
+    // Tiled windows we faded out because a zoomed window covers them.
+    std::vector<PHLWINDOWREF> g_faded;
 
-    // Like maximize: don't draw tiled windows a zoomed window fully covers.
-    // Uses the current (animated) boxes, so a window stays visible until the
-    // zoom animation has actually covered it.
+    bool isZoomed(const PHLWINDOW& w);
+
+    // Is this tiled window fully inside a zoomed window's (final) layout box?
     bool coveredByZoom(const PHLWINDOW& w) {
-        if (g_zoomed.empty() || !w || w->isFloating())
+        if (g_zoomed.empty() || !w || w->isFloating() || isZoomed(w))
             return false;
 
-        const auto BOX = w->getWindowMainSurfaceBox();
+        const auto BOX = w->layoutBox();
 
         for (const auto& ref : g_zoomed) {
             const auto ZOOMED = ref.lock();
-            if (!ZOOMED || ZOOMED == w || ZOOMED->isFloating() || !ZOOMED->mapped() || ZOOMED->isHidden())
+            if (!ZOOMED || ZOOMED->isFloating() || !ZOOMED->mapped() || ZOOMED->isHidden())
                 continue;
             if (ZOOMED->m_workspace != w->m_workspace)
                 continue;
 
-            const auto  Z   = ZOOMED->getWindowMainSurfaceBox();
+            const auto       Z   = ZOOMED->layoutBox();
             constexpr double EPS = 2.0;
             if (BOX.x >= Z.x - EPS && BOX.y >= Z.y - EPS && BOX.x + BOX.w <= Z.x + Z.w + EPS && BOX.y + BOX.h <= Z.y + Z.h + EPS)
                 return true;
@@ -85,10 +86,36 @@ namespace {
         return false;
     }
 
-    bool hkShouldRenderWindowInScene(void* thisptr, PHLWINDOW window, PHLMONITOR monitor, PHLWORKSPACE workspace, uint8_t mode) {
-        if (coveredByZoom(window))
-            return false;
-        return ((shouldRenderFn)g_shouldRenderHook->m_original)(thisptr, window, monitor, workspace, mode);
+    // Animate a window's "fullscreen" alpha, the same value Hyprland fades to
+    // 0 for windows under a maximized one (using the fadeIn animation). The
+    // renderer already skips windows whose alpha reached 0.
+    void fadeTo(const PHLWINDOW& w, float target) {
+        if (w->isBlockedByFullscreen()) // real fullscreen/maximize owns it
+            return;
+        auto& alpha = w->presentation().alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+        if (alpha->goal() != target)
+            *alpha = target;
+    }
+
+    // Like maximize: fade out tiled windows a zoomed window fully covers, and
+    // fade back in the ones that are no longer covered.
+    void updateFaded() {
+        std::vector<PHLWINDOWREF> nowCovered;
+        for (const auto& w : Desktop::windowState()->windows()) {
+            if (w->mapped() && coveredByZoom(w))
+                nowCovered.emplace_back(w);
+        }
+
+        for (const auto& ref : g_faded) {
+            const auto W = ref.lock();
+            if (W && !std::ranges::any_of(nowCovered, [&](const PHLWINDOWREF& c) { return c.lock() == W; }))
+                fadeTo(W, 1.F);
+        }
+
+        for (const auto& ref : nowCovered)
+            fadeTo(ref.lock(), 0.F);
+
+        g_faded = std::move(nowCovered);
     }
 
     void pruneDead() {
@@ -127,6 +154,13 @@ namespace {
         // the subtree ourselves after the original has positioned everything.
         if (!g_zoomed.empty())
             applyZoom(thisptr);
+
+        // Also runs once zoom ends (e.g. the zoomed window closed), so faded
+        // windows come back.
+        if (!g_zoomed.empty() || !g_faded.empty()) {
+            pruneDead();
+            updateFaded();
+        }
     }
 
     Config::ErrorResult hkLayoutMsg(CDwindleAlgorithm* thisptr, const std::string_view& sv) {
@@ -148,6 +182,7 @@ namespace {
         }
 
         thisptr->recalculate();
+        updateFaded();
         return {};
     }
 
@@ -177,8 +212,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     const auto RECALC    = findOne("recalcSizePosRecursive", "SDwindleNodeData::recalcSizePosRecursive");
     const auto LAYOUTMSG = findOne("layoutMsg", "CDwindleAlgorithm::layoutMsg");
     const auto WINDOWAT  = findOne("windowAtInternal", "CViewHitTester::windowAtInternal");
-    const auto SHOULDRENDER = findOne("shouldRenderWindowInScene", "IHyprRenderer::shouldRenderWindowInScene");
-    if (!RECALC || !LAYOUTMSG || !WINDOWAT || !SHOULDRENDER) {
+    if (!RECALC || !LAYOUTMSG || !WINDOWAT) {
         HyprlandAPI::addNotification(handle, "[zoomparent] dwindle functions not found", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
         throw std::runtime_error("[zoomparent] functions not found");
     }
@@ -186,10 +220,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_recalcHook    = HyprlandAPI::createFunctionHook(handle, RECALC, (void*)&hkRecalcSizePosRecursive);
     g_layoutMsgHook = HyprlandAPI::createFunctionHook(handle, LAYOUTMSG, (void*)&hkLayoutMsg);
     g_windowAtHook  = HyprlandAPI::createFunctionHook(handle, WINDOWAT, (void*)&hkWindowAtInternal);
-    g_shouldRenderHook = HyprlandAPI::createFunctionHook(handle, SHOULDRENDER, (void*)&hkShouldRenderWindowInScene);
 
-    if (!g_recalcHook || !g_layoutMsgHook || !g_windowAtHook || !g_shouldRenderHook || !g_recalcHook->hook() || !g_layoutMsgHook->hook() || !g_windowAtHook->hook() ||
-        !g_shouldRenderHook->hook()) {
+    if (!g_recalcHook || !g_layoutMsgHook || !g_windowAtHook || !g_recalcHook->hook() || !g_layoutMsgHook->hook() || !g_windowAtHook->hook()) {
         HyprlandAPI::addNotification(handle, "[zoomparent] failed to hook dwindle", CHyprColor{1.0, 0.2, 0.2, 1.0}, 8000);
         throw std::runtime_error("[zoomparent] hook failed");
     }
@@ -199,5 +231,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     g_zoomed.clear();
+    // bring back anything we faded out
+    for (const auto& ref : g_faded) {
+        if (const auto W = ref.lock())
+            fadeTo(W, 1.F);
+    }
+    g_faded.clear();
     // Hooks are removed by Hyprland when the plugin unloads.
 }
